@@ -1260,3 +1260,6 @@ fn metadata_empty_dont_code_gets_cached() {
 		assert!(<AccountCodesMetadata<Test>>::get(address).is_none());
 	});
 }
+
+// TODO: treasury field in genesis config is added to Treasury storage
+// TODO: OnChargeEVMTransaction implementation for SendToTreasuryOnChargeTransaction

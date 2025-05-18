@@ -530,6 +530,7 @@ pub mod pallet {
 	#[derive(frame_support::DefaultNoBound)]
 	pub struct GenesisConfig<T> {
 		pub accounts: BTreeMap<H160, GenesisAccount>,
+		pub treasury: H160,
 		#[serde(skip)]
 		pub _marker: PhantomData<T>,
 	}
@@ -565,8 +566,15 @@ pub mod pallet {
 					<AccountStorages<T>>::insert(address, index, value);
 				}
 			}
+
+			let treasury = T::AddressMapping::into_account_id(self.treasury);
+			Treasury::<T>::put(treasury);
 		}
 	}
+
+	#[pallet::storage]
+	#[pallet::getter(fn treasury)]
+	pub type Treasury<T: Config> = StorageValue<_, T::AccountId, OptionQuery>;
 
 	#[pallet::storage]
 	pub type AccountCodes<T: Config> = StorageMap<_, Blake2_128Concat, H160, Vec<u8>, ValueQuery>;
@@ -1156,6 +1164,75 @@ where
 
 	fn pay_priority_fee(tip: Self::LiquidityInfo) {
 		<EVMFungibleAdapter<T::Currency, ()> as OnChargeEVMTransaction<T>>::pay_priority_fee(tip);
+	}
+}
+
+pub struct SendToTreasuryOnChargeTransaction<T, F>(core::marker::PhantomData<(T, F)>);
+
+impl<T, F> OnChargeEVMTransaction<T> for SendToTreasuryOnChargeTransaction<T, F>
+where
+	T: Config<AccountId: From<H160>>,
+	F: Balanced<T::AccountId>,
+	U256: UniqueSaturatedInto<<F as Inspect<<T as frame_system::Config>::AccountId>>::Balance>,
+{
+	// Kept type as Option to satisfy bound of Default
+	type LiquidityInfo = Option<Credit<T::AccountId, F>>;
+
+	fn withdraw_fee(who: &H160, fee: U256) -> Result<Self::LiquidityInfo, Error<T>> {
+		if fee.is_zero() {
+			return Ok(None);
+		}
+		let account_id = T::AddressMapping::into_account_id(*who);
+		let imbalance = F::withdraw(
+			&account_id,
+			fee.unique_saturated_into(),
+			Precision::Exact,
+			Preservation::Preserve,
+			Fortitude::Polite,
+		)
+			.map_err(|_| Error::<T>::BalanceLow)?;
+		Ok(Some(imbalance))
+	}
+
+	fn correct_and_deposit_fee(
+		who: &H160,
+		corrected_fee: U256,
+		base_fee: U256,
+		already_withdrawn: Self::LiquidityInfo,
+	) -> Self::LiquidityInfo {
+		if let Some(paid) = already_withdrawn {
+			let account_id = T::AddressMapping::into_account_id(*who);
+
+			// Calculate how much refund we should return
+			let refund_amount = paid
+				.peek()
+				.saturating_sub(corrected_fee.unique_saturated_into());
+			// refund to the account that paid the fees.
+			let refund_imbalance = F::deposit(&account_id, refund_amount, Precision::BestEffort)
+				.unwrap_or_else(|_| Debt::<T::AccountId, F>::zero());
+
+			// merge the imbalance caused by paying the fees and refunding parts of it again.
+			let adjusted_paid = paid
+				.offset(refund_imbalance)
+				.same()
+				.unwrap_or_else(|_| Credit::<T::AccountId, F>::zero());
+
+			let (base_fee, tip) = adjusted_paid.split(base_fee.unique_saturated_into());
+			// Handle base fee. Can be either burned, rationed, etc ...
+			let treasury = Treasury::<T>::get().unwrap_or_else(|| T::AccountId::from(H160::zero()));
+			let _ = F::deposit(&treasury, base_fee.peek(), Precision::BestEffort)
+				.unwrap_or_else(|_| Debt::<T::AccountId, F>::zero());
+			return Some(tip);
+		}
+		None
+	}
+
+	fn pay_priority_fee(tip: Self::LiquidityInfo) {
+		// Default Ethereum behaviour: issue the tip to the block author.
+		if let Some(tip) = tip {
+			let account_id = T::AddressMapping::into_account_id(<Pallet<T>>::find_author());
+			let _ = F::deposit(&account_id, tip.peek(), Precision::BestEffort);
+		}
 	}
 }
 
